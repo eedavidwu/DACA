@@ -46,8 +46,8 @@ def compute_AvePSNR(model,dataloader,snr):
 def main():
     parser = argparse.ArgumentParser()
     #Train:
-    parser.add_argument("--best_ckpt_path", default='./ckpts/', type=str,help='best model path')
-    parser.add_argument("--all_epoch", default='150', type=int,help='Train_epoch')
+    parser.add_argument("--best_ckpt_path", default='./ckpts_h_ad/', type=str,help='best model path')
+    parser.add_argument("--all_epoch", default='200', type=int,help='Train_epoch')
     parser.add_argument("--best_choice", default='loss', type=str,help='select epoch [loss/PSNR]')
     parser.add_argument("--flag", default='train', type=str,help='train or eval for JSCC')
     parser.add_argument("--attention_num", default=0, type=int,help='attention_number')
@@ -59,24 +59,27 @@ def main():
     #parser.add_argument("--input_const_snr", default=1, type=float,help='SNR (db)')
     parser.add_argument("--cp_num", default='16', type=int,help='CP num, 0.25*subcariier')
     parser.add_argument("--gama", default='4', type=int,help='time delay constant for multipath fading channel')
+    parser.add_argument("--H_perfect", default=0, type=int,help='H perfect or not')
+
+
     #PAPR loss:
     parser.add_argument("--h_stddev", default=1, type=float,help='awgn/slow fading/burst')
     parser.add_argument("--equalization", default=1, type=float,help='Equalization_flag')
-    parser.add_argument("--S", default=2, type=int,help='number of symbol')
+    parser.add_argument("--S", default=4, type=int,help='number of symbol')
     parser.add_argument("--M", default=64, type=int,help='number of subcarrier')
-    parser.add_argument("--tcn", default=4, type=int,help='tansmit_channel_num for djscc')
+    parser.add_argument("--tcn", default=8, type=int,help='tansmit_channel_num for djscc')
     parser.add_argument("--N_pilot", default=1, type=int,help='number of pilot symbol')
 
     parser.add_argument("--input_snr_max", default=20, type=float,help='SNR (db)')
     parser.add_argument("--input_snr_min", default=0, type=int,help='SNR (db)')
     parser.add_argument("--train_snr_list",nargs='+', type=int, help='Train SNR (db)')
     #parser.add_argument("--train_snr_list_in",nargs='+', type=list, help='Train SNR (db)')
-    parser.add_argument("--tran_know_flag", type=int,help='tansmit_know flag')
+    parser.add_argument("--tran_know_flag", default=1,type=int,help='tansmit_know flag')
     parser.add_argument("--hard_PA", default=0, type=int,help='PA is hard or soft')
 
 
 
-    parser.add_argument("--train_snr", default=10,type=int, help='Train SNR (db)')
+    parser.add_argument("--train_snr", default=5,type=int, help='Train SNR (db)')
 
     parser.add_argument("--resume", default=False,type=bool, help='Load past model')
     #parser.add_argument("--snr_num",default=4,type=int,help="num of snr")
@@ -88,29 +91,32 @@ def main():
 
     global args
     args=parser.parse_args()
+    print("test in H flag",args.H_perfect)
 
     # Load data
     transform = transforms.Compose(
         [transforms.ToTensor(), ])
     testset = torchvision.datasets.CIFAR10(root='./data', train=False,
                                            download=True, transform=transform)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=128,
+    testloader = torch.utils.data.DataLoader(testset, batch_size=256,
                                              shuffle=False, num_workers=2)
     #model_name='JSCC_OFDM'
     #train_snr=5
-    ckpt_folder='./ckpts_4/ckpts'
+    ckpt_folder='./ckpts'
 
     if args.model=='DAS_JSCC_OFDM':
         train_snr='random'
+        #train_snr=5
+
         auto_encoder=OFDM_models.Attention_all_JSCC(args)
-        model_path=os.path.join(ckpt_folder,'best_fading_transmit_1_4_'+args.model+'_SNR_'+str(train_snr)+'.pth')
+        model_path=os.path.join(ckpt_folder,'Re_best_fading_rate_8_transmit_1_equal_1_'+args.model+'_SNR_'+str(train_snr)+'.pth')
         #python eval.py --tran_know_flag 1 --model DAS_JSCC_OFDM
 
     elif args.model=='JSCC_OFDM':
         train_snr=args.train_snr
         auto_encoder=OFDM_models.Classic_JSCC(args)
         #model_path=os.path.join(ckpt_folder,'best_fading_4_'+args.model+'_SNR_'+str(train_snr)+'.pth')
-        model_path='./ckpts_8/best_fading_H_'+args.model+'_SNR_'+str(train_snr)+'.pth'
+        model_path='./ckpts_h_ad/best_fading_rate_8_'+args.model+'_SNR_'+str(train_snr)+'.pth'
 
     #for train_snr in ['5','10','15','19']:
         #train_snr='5'
@@ -135,9 +141,8 @@ def main():
     #SNR_2_list=[1,4,9,12,16,19]
     PSNR_list=[]
 
-    #for i in range(20):
-    for i in [1,10,19]:
-
+    for i in range(20):
+    #for i in [1,1,19]:
         #i=4
         #j=2
         validate_snr=i

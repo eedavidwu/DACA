@@ -9,72 +9,6 @@ import numpy as np
 import math
 import random
 
-
-class Fading_Channel(nn.Module):
-    def __init__(self, args):
-        super(Fading_Channel, self).__init__()
-        self.gama=args.gama
-
-    def complex_convolution(self,inputs,h):
-        in_shape=inputs.shape
-        sub_channel_num=in_shape[2]
-        kernel_real=torch.real(h)
-        kernel_img=torch.imag(h)
-
-
-        weight_real=nn.Parameter(data=kernel_real,requires_grad=False)
-        weight_img=nn.Parameter(data=kernel_img,requires_grad=False)
-
-        inputs_real=torch.real(inputs).float()
-        inputs_img=torch.imag(inputs).float()
-
-        out_r_r=F.conv1d(inputs_real,weight_real,groups=12,padding=sub_channel_num)[:,:,sub_channel_num-sub_channel_num//2:sub_channel_num+sub_channel_num//2,]
-        out_r_im=F.conv1d(inputs_real,weight_img,groups=12,padding=sub_channel_num)[:,:,sub_channel_num-sub_channel_num//2:sub_channel_num+sub_channel_num//2,]
-        out_im_r=F.conv1d(inputs_img,weight_real,groups=12,padding=sub_channel_num)[:,:,sub_channel_num-sub_channel_num//2:sub_channel_num+sub_channel_num//2,]
-        out_im_im=F.conv1d(inputs_img,weight_img,groups=12,padding=sub_channel_num)[:,:,sub_channel_num-sub_channel_num//2:sub_channel_num+sub_channel_num//2,]
-        out_real=out_r_r-out_im_im
-        out_im=out_r_im+out_im_r
-        out=torch.complex(out_real,out_im)
-        return out,h
-    def compensation(self,inputs,h_broadcast):
-        h_norm_square_broadcast=torch.square(torch.abs(h_broadcast))
-        h_conj_broadcast=torch.conj(h_broadcast)
-        h_norm_square_inverse=torch.where(h_norm_square_broadcast>0,1/h_norm_square_broadcast,h_norm_square_broadcast)
-
-        compensate_matrix=torch.transpose(h_norm_square_inverse*h_conj_broadcast,1,2)
-        out=torch.bmm(compensate_matrix,inputs)
-        #out=(h_conj_broadcast*inputs)/h_norm_broadcast
-        return out
-        
-    def forward(self, inputs,h,input_snr):
-        in_shape=inputs.shape
-        batch_size=in_shape[0]
-
-        ##Through fading channel
-        complex_para_out=torch.bmm(h,inputs)
-
-        ##awgn:
-        noise_stddev=(np.sqrt(10**(-input_snr/10))/np.sqrt(2)).reshape(-1,1,1)
-        noise_stddev_board=torch.from_numpy(noise_stddev).repeat(1,in_shape[1],in_shape[2]).cuda()
-        mean=torch.zeros_like(noise_stddev_board).cuda()
-        noise_real=Variable(torch.normal(mean=mean,std=noise_stddev_board).cuda()).float()
-        noise_img=Variable(torch.normal(mean=mean,std=noise_stddev_board).cuda()).float()
-        noise_complex=torch.complex(noise_real,noise_img)
-
-        #idea H:
-        H_idea=torch.ones_like(h)
-        
-        ##y=hx+w
-        channel_out=complex_para_out+noise_complex
-
-        ##compensation:
-        channel_com_out=self.compensation(channel_out,h)
-
-        new_noise=self.compensation(noise_complex,h)
-        new_out=torch.bmm(H_idea,inputs)+new_noise
-
-        return channel_com_out#,inputs_in_norm
-
 class FL_En_Module(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size,stride,padding,activation=None):
         super(FL_En_Module, self).__init__()
@@ -124,8 +58,11 @@ class AL_En_Module(nn.Module):
     def forward(self, inputs,attention):
         #attention
         c_out=self.Channel_attention(inputs,attention)
+        #s_out=self.Spatial_attention(inputs,attention)
         s_out=self.Spatial_attention(c_out,attention)
-        return s_out
+        out=s_out
+        #out=c_out+s_out
+        return out
 class AL_De_Module(nn.Module):
     def __init__(self,attention_size,channel_in_size,feature_in_size):
         super(AL_De_Module, self).__init__()
@@ -187,17 +124,22 @@ class AL_SP_Module(nn.Module):
         out=out_fc_2_sig*inputs
         return out
 
-class PA_Module(nn.Module):
-    def __init__(self,attention_size):
-        super(PA_Module, self).__init__()
-        self.FC_1 = nn.Linear(attention_size,attention_size//4)
-        self.FC_2 = nn.Linear(attention_size//4,attention_size)
-    def forward(self, h):
-        out_fc_1=self.FC_1(h)
+class Channel_SP_Mask_Module(nn.Module):
+    def __init__(self,attention_size,in_channel_size,in_feature_size):
+        super(Channel_SP_Mask_Module, self).__init__()
+        self.input_size=in_channel_size*in_feature_size
+        self.FC_1 = nn.Linear(self.input_size+attention_size,self.input_size//16)
+        self.FC_2 = nn.Linear(self.input_size//16,self.input_size)
+    def forward(self, inputs,attention_size):
+        #out_channel_pooling=self.channel_pooling(inputs).squeeze()
+        batch_size=inputs.shape[0]
+        in_shape=inputs.shape
+        inputs_vector=inputs.view(batch_size,-1)
+        input_fc=torch.cat((inputs_vector,attention_size),dim=1)
+        out_fc_1=self.FC_1(input_fc)
         out_fc_1_relu=torch.nn.functional.relu(out_fc_1)
-        out_fc_2=self.FC_2(out_fc_1_relu)
-        out_fc_2_sig=torch.softmax(out_fc_2,dim=1)
-        return out_fc_2_sig
+        out_fc_2=self.FC_2(out_fc_1_relu).view(in_shape)
+        return out_fc_2
 
 class FL_De_Module(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size,stride,padding,out_padding,activation=None):
@@ -287,30 +229,23 @@ class Attention_Encoder(nn.Module):
         #self.AL_SP_Module_4=AL_SP_Module(256,64)
 
         self.FL_Module_5 = FL_En_Module(256, args.tcn, 5, stride=1,padding=2)
-        #self.SP_Mask_Module_5=Channel_SP_Mask_Module(args.tcn,64)
+        #self.SP_Mask_Module_5=Channel_SP_Mask_Module(attention_size,args.tcn,64)
 
 
     def forward(self, x,attention):
         encoded_1_out = self.FL_Module_1(x)
         attention_encoder_1_out=self.AL_Module_1(encoded_1_out,attention)
-        #encoded_1_c_out=self.AL_CH_Module_1(encoded_1_out,h,snr)
-        #attention_encoder_1_out=self.AL_SP_Module_1(encoded_1_c_out,h,snr)
-
+        
         encoded_2_out = self.FL_Module_2(attention_encoder_1_out)
         attention_encoder_2_out=self.AL_Module_2(encoded_2_out,attention)
-        #encoded_2_c_out=self.AL_CH_Module_2(encoded_2_out,h,snr)
-        #attention_encoder_2_out=self.AL_SP_Module_2(encoded_2_c_out,h,snr)
-
+        
         encoded_3_out = self.FL_Module_3(attention_encoder_2_out)
         attention_encoder_3_out=self.AL_Module_3(encoded_3_out,attention)
-        #encoded_3_c_out=self.AL_CH_Module_2(encoded_3_out,h,snr)
-        #attention_encoder_3_out=self.AL_SP_Module_2(encoded_3_c_out,h,snr)
+        
         encoded_4_out = self.FL_Module_4(attention_encoder_3_out)
         attention_encoder_4_out=self.AL_Module_4(encoded_4_out,attention)
 
         encoded_5_out = self.FL_Module_5(attention_encoder_4_out)
-        #attention_encoder_5_out=self.SP_Mask_Module_5(encoded_5_out,h,snr)
-
         return encoded_5_out
 
 class Attention_Decoder(nn.Module):
@@ -353,17 +288,20 @@ class Classic_JSCC(nn.Module):
         super(Classic_JSCC, self).__init__()
         # Input size: [batch, 3, 32, 32]
         # Output size: [batch, 3, 32, 32]
-        self.encoder = Encoder(args)
+        attention_size_encoder=64
+        self.tran_know_flag=args.tran_know_flag
+        if self.tran_know_flag==1:
+            self.attention_encoder = Attention_Encoder(args,attention_size_encoder)
+        else:
+            self.encoder = Encoder(args)
         self.decoder=Decoder(args)
-        self.PA_flag=args.hard_PA
-        if self.PA_flag==1:
-            self.PA=PA_Module(64)
         self.num_sub=args.M
         self.num_sym=args.S
         #pilot_path=args.pilot_path
         self.h_std=args.h_stddev
         self.equalization=args.equalization
         self.pilot=(self.zcsequence(3,self.num_sub)).repeat(args.N_pilot,1)
+        #self.equalization=args.equalization
     def zcsequence(self,u, seq_length, q=0):
         """
         Generate a Zadoff-Chu (ZC) sequence.
@@ -411,16 +349,12 @@ class Classic_JSCC(nn.Module):
         in_shape=feature.shape
         batch_size=in_shape[0]
         z_in=feature.reshape(batch_size,-1)
-        symbols_each_img=z_in.shape[1]
-        z_in_mean=z_in.mean(dim=1).unsqueeze(dim=1).repeat(1,symbols_each_img)
-        z_in=z_in-z_in_mean
         sig_pwr=torch.square(torch.abs(z_in))
         ave_sig_pwr=sig_pwr.mean(dim=1).unsqueeze(dim=1)
         z_in_norm=z_in/(torch.sqrt(ave_sig_pwr))
         inputs_in_norm=z_in_norm.reshape(in_shape)
         return inputs_in_norm
             
-    
     def transmit(self,feature,snr,h):
         feature_shape=feature.shape
         #prepare h: [batch,S,M)
@@ -489,39 +423,33 @@ class Classic_JSCC(nn.Module):
         snr=np.full(batch_size,input_snr)
         channel_snr=torch.from_numpy(snr).float().cuda().view(-1,1).cuda()
 
-        for transmit_times in range (10):
+        for transmit_times in range (5):
             #prepare H:
             #h:C[batch,M]; h_attention:R[batch,2M]
             h=self.compute_h_broadcast(batch_size,self.num_sub).cuda()
+            h_norm=torch.abs(h)
             #transmit pilot to estimate h
             Y_p_norm_head=self.transmit(Y_p_norm,channel_snr,h)
             h_est_ls=self.LS_est(Y_p_norm,Y_p_norm_head).squeeze()
-            dist_ls=torch.dist(h,h_est_ls)
+            #dist_ls=torch.dist(h,h_est_ls)
             h_est_mmse=self.MMSE_est(Y_p_norm,Y_p_norm_head,channel_snr).squeeze()
-            dist_mmse=torch.dist(h,h_est_mmse)
+            #dist_mmse=torch.dist(h,h_est_mmse)
+            h_est_mmse_norm=torch.abs(h_est_mmse)
             h_est=h_est_mmse
+            encoder_attention=h_est_mmse_norm
             #encode
-            encoded_out = self.encoder(x)
+            if self.tran_know_flag==1:
+                encoded_out = self.attention_encoder(x,encoder_attention)
+            elif self.tran_know_flag==0:
+                encoded_out = self.encoder(x)
+            #encoded_out = self.encoder(x)
             encoded_shape=encoded_out.shape
             z=encoded_out.view(batch_size,-1)
             complex_list=torch.split(z,(z.shape[1]//2),dim=1)
             encoded_out_complex=torch.complex(complex_list[0],complex_list[1])
             Y=encoded_out_complex.view(batch_size,self.num_sym,-1)            
             ####Power constraint for each sending:
-            Y_norm_1=self.power_normalize(Y)
-
-            ##power allocation:
-            if self.PA_flag==1:
-                h_norm=torch.abs(h)
-                located_weight=self.PA(h_norm).unsqueeze(dim=1).repeat(1,self.num_sym,1)
-                Y_located=Y_norm_1*located_weight
-                Y_norm=self.power_normalize(Y_located)
-            else:
-                Y_norm=Y_norm_1
-
-            #Y_norm=self.power_normalize(Y)
-            #transmit_shape=Y_norm.shape
-
+            Y_norm=self.power_normalize(Y)
             Y_norm_head=self.transmit(Y_norm,channel_snr,h)
             ##Equalization:
             if self.equalization==1:
@@ -529,35 +457,26 @@ class Classic_JSCC(nn.Module):
                 h_broadcast_est=h_est.unsqueeze(dim=1).repeat(1,Y_norm_head.shape[1],1)
                 compensation_factor=(torch.conj(h_broadcast_est)/(torch.square(torch.abs(h_broadcast_est))))
                 Y_norm_head=compensation_factor*Y_norm_head
-            elif self.equalization==2:
-                #concat all
-                h_broadcast=h.unsqueeze(dim=1).repeat(1,Y_norm_head.shape[1],1)
-                compensation_factor=(torch.conj(h_broadcast)/(torch.square(torch.abs(h_broadcast))))
-                Y_norm_head_com=compensation_factor*Y_norm_head
-                #Y_norm_head=torch.cat((Y_norm_head,Y_norm_head_com),dim=1)
-                #Y_p_de=torch.cat((torch.real(Y_p),torch.imag(Y_p)),dim=2)
-                #Y_p_head_de=torch.cat((torch.real(Y_p_head),torch.imag(Y_p_head)),dim=2)
-                #Y_head_de=torch.cat((torch.real(Y_head),torch.imag(Y_head)),dim=2)
-                #decoder_input=torch.cat((Y_p_de,Y_p_head_de,Y_head_de),dim=1).view(batch_size,-1,encoded_shape[2],encoded_shape[3]).float()
-            
-            Y_norm_head=Y_norm_head.view(batch_size,-1)
-            Y_norm_head=torch.cat((torch.real(Y_norm_head),torch.imag(Y_norm_head)),dim=1)
-            decoder_input=Y_norm_head.view(encoded_shape).float()
+                Y_norm_head=Y_norm_head.view(batch_size,-1)
+                Y_norm_head_real=torch.cat((torch.real(Y_norm_head),torch.imag(Y_norm_head)),dim=1).view(encoded_shape).float()
+                decoder_input=Y_norm_head_real
             x_head= self.decoder(decoder_input)
             x_head_ave=x_head_ave+x_head
         #papr_ave=papr+papr_ave
         #x_head_ave=x_head+x_head_ave
-        x_head_ave=x_head_ave/10
-
+        #papr_ave=papr_ave/5
+        x_head_ave=x_head_ave/5
         return x_head_ave
 
 class Attention_all_JSCC(nn.Module):
     def __init__(self,args):
         super(Attention_all_JSCC, self).__init__()
-        attention_size_encoder=128
-        attention_size_decoder=128
-        self.attention_encoder = Attention_Encoder(args,attention_size_encoder)
-        self.encoder = Encoder(args)
+        attention_size_encoder=65
+        attention_size_decoder=65
+        if args.tran_know_flag==1:
+            self.attention_encoder = Attention_Encoder(args,attention_size_encoder)
+        elif args.tran_know_flag==0:
+            self.encoder = Encoder(args)
         self.attention_decoder=Attention_Decoder(args,attention_size_decoder)
         self.gama=args.gama
         self.SNR_min=args.input_snr_min
@@ -568,8 +487,19 @@ class Attention_all_JSCC(nn.Module):
         self.h_std=args.h_stddev
         self.equalization=args.equalization
         self.tran_know_flag=args.tran_know_flag
+        self.H_flag=args.H_perfect
         
         # Generate the pilot signal
+        '''
+        if not os.path.exists(pilot_path):
+            bits = torch.randint(2, (args.M,2))
+            torch.save(bits,pilot_path)
+            pilot = (2*bits-1).float()
+        else:
+            bits = torch.load(pilot_path)
+            pilot = (2*bits-1).float()
+            pilot_c=torch.complex(pilot[:,0],pilot[:,1])
+        '''
         self.pilot=(self.zcsequence(3,self.num_sub)).repeat(args.N_pilot,1)
         #self.pilot = pilot_c.repeat(args.N_pilot,1)
     def zcsequence(self,u, seq_length, q=0):
@@ -607,20 +537,16 @@ class Attention_all_JSCC(nn.Module):
         zcseq=torch.complex(real_part,img_part)
         return zcseq
 
-    def compute_h_fast_broadcast(self,batch_size,subchannel_num):
-        h_stddev=torch.full((batch_size,subchannel_num),np.sqrt((self.h_std*self.h_std)/2)).float()
-        h_mean=torch.zeros_like(h_stddev).float()
-        h_real=Variable(torch.normal(mean=h_mean,std=h_stddev)).float()
-        h_img=Variable(torch.normal(mean=h_mean,std=h_stddev)).float()
-        h=torch.complex(h_real,h_img)
-        return h
     def compute_h_slow_broadcast(self,batch_size,subchannel_num):
         h_stddev=torch.full((batch_size,subchannel_num),np.sqrt((self.h_std*self.h_std)/2)).float()
         h_mean=torch.zeros_like(h_stddev).float()
         h_real=Variable(torch.normal(mean=h_mean,std=h_stddev)).float()
         h_img=Variable(torch.normal(mean=h_mean,std=h_stddev)).float()
         h=torch.complex(h_real,h_img)
-        return h
+        h_norm=torch.abs(h)
+        h_norm_sorted,indice=torch.sort(h_norm,dim=1)
+        h_out=torch.gather(h,1,indice)
+        return h_out
 
     def power_normalize(self,feature):
         in_shape=feature.shape
@@ -643,6 +569,7 @@ class Attention_all_JSCC(nn.Module):
         feature_shape=feature.shape
         #prepare h: [batch,S,M)
         h_broadcast=h.unsqueeze(dim=1).repeat(1,feature_shape[1],1)
+        
         #prepare W: [batch,S,M)
         noise_stddev=(torch.sqrt(10**(-snr/10))/torch.sqrt(torch.tensor(2))).reshape(-1,1,1)
         noise_stddev_board=noise_stddev.repeat(1,feature_shape[1],feature_shape[2]).float()
@@ -650,6 +577,7 @@ class Attention_all_JSCC(nn.Module):
         noise_real=Variable(torch.normal(mean=mean,std=noise_stddev_board).cuda()).float()
         noise_img=Variable(torch.normal(mean=mean,std=noise_stddev_board).cuda()).float()
         w=torch.complex(noise_real,noise_img)
+        
         #compute channel_out
         channel_out=h_broadcast*feature+w
         #compensation_factor=(torch.conj(h_broadcast)/(torch.square(torch.abs(h_broadcast))))
@@ -706,29 +634,39 @@ class Attention_all_JSCC(nn.Module):
         else:
             snr=np.full(batch_size,input_snr)
         channel_snr=torch.from_numpy(snr).float().cuda().view(-1,1).cuda()
-        channel_snr_attention=channel_snr.unsqueeze(dim=2).repeat(1,self.num_sub,1)
-
-        for transmit_times in range (8):
+        #channel_snr_attention=channel_snr.unsqueeze(dim=2).repeat(1,self.num_sub,1)
+        channel_snr_attention=channel_snr
+        for transmit_times in range (5):
             #prepare H:
             #h:C[batch,M]; h_attention:R[batch,2M]
             h=self.compute_h_slow_broadcast(batch_size,self.num_sub).cuda()
-            h_norm=torch.abs(h)
+            #h_norm=torch.abs(h)
+            
+            #encoder_attention=h_norm
+            #decoder_attention=h_norm
 
             #transmit pilot to estimate h
             Y_p_norm_head=self.transmit(Y_p_norm,channel_snr,h)
             h_est_ls=self.LS_est(Y_p_norm,Y_p_norm_head).squeeze()
             h_est_ls_norm=torch.abs(h_est_ls)
-            dist_ls_norm=torch.dist(h_norm,h_est_ls_norm)
+            #dist_ls_norm=torch.dist(h_norm,h_est_ls_norm)
             h_est_mmse=self.MMSE_est(Y_p_norm,Y_p_norm_head,channel_snr).squeeze()
-            h_est_mmse_norm=torch.abs(h_est_mmse)
-            dist_mmse_norm=torch.dist(h_norm,h_est_mmse_norm)
+            
+
+            #dist_mmse_norm=torch.dist(h_norm,h_est_mmse_norm)
             #h_attention=torch.cat((torch.real(h_est_mmse),torch.imag(h_est_mmse)),dim=1)
             #h_attention=torch.cat((torch.real(h_est_mmse),torch.imag(h_est_mmse)),dim=1)
             #h_attention_ls_norm=h_est_ls_norm
             #h_attention=torch.stack((torch.real(h_est_mmse),torch.imag(h_est_mmse)),dim=2)
-            h_attention=h_est_mmse_norm.unsqueeze(dim=2)
-            h_est=h_est_mmse
-            all_channel_attention=torch.cat((h_attention,channel_snr_attention),dim=2).reshape(batch_size,-1)
+            #h_attention=h_est_mmse_norm.unsqueeze(dim=2)
+            if self.H_flag==0:
+                h_est=h_est_mmse
+            else:
+                h_est=h
+            h_est_norm=torch.abs(h_est)
+            h_attention=h_est_norm#.unsqueeze(dim=2)
+
+            all_channel_attention=torch.cat((h_attention,channel_snr_attention),dim=1)#.reshape(batch_size,-1)
             encoder_attention=all_channel_attention
             decoder_attention=all_channel_attention
 
@@ -741,8 +679,12 @@ class Attention_all_JSCC(nn.Module):
             encoded_shape=encoded_out.shape
             #reshape and get feature to transmitter
             z=encoded_out.view(batch_size,-1)
-            complex_list=torch.split(z,(z.shape[1]//2),dim=1)
-            encoded_out_complex=torch.complex(complex_list[0],complex_list[1])
+            complex_list=z.view(batch_size,-1,2)
+            real_list=complex_list[:,:,0]
+            img_list=complex_list[:,:,1]
+            encoded_out_complex=torch.complex(real_list,img_list)
+            #complex_list=torch.split(z,(z.shape[1]//2),dim=1)
+            #encoded_out_complex=torch.complex(complex_list[0],complex_list[1])
             Y=encoded_out_complex.view(batch_size,self.num_sym,-1)            
             ####Power constraint for each sending:
             Y_norm=self.power_normalize(Y)
@@ -772,6 +714,6 @@ class Attention_all_JSCC(nn.Module):
             x_head= self.attention_decoder(decoder_input,decoder_attention)
             x_head_ave=x_head_ave+x_head
 
-        x_head_ave=x_head_ave/8
+        x_head_ave=x_head_ave/5
 
         return x_head_ave
